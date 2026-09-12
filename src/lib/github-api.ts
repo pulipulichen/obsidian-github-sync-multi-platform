@@ -202,7 +202,16 @@ export class GitHubClient {
     if (response.status === 200) {
       return response.json as GitHubTree;
     }
+    // 全新空倉庫沒有 commit / tree，GitHub Trees API 會回 409。
+    // 當成「遠端沒有任何檔案」，讓後續同步能用 Contents API 建立第一個 commit。
+    if (this.isEmptyRepositoryResponse(response.status, response.text)) {
+      return { sha: "", url: "", tree: [], truncated: false };
+    }
     throw new Error(`Failed to get tree: HTTP ${response.status} - ${response.text}`);
+  }
+
+  private isEmptyRepositoryResponse(status: number, text: string): boolean {
+    return status === 409 && /Git Repository is empty/i.test(text);
   }
 
   // Helper to decode base64 content from GitHub
