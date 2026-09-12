@@ -202,7 +202,18 @@ export class GitHubClient {
     if (response.status === 200) {
       return response.json as GitHubTree;
     }
+
+    // A brand-new repository has no commits or tree yet, and GitHub returns 409.
+    // Treat it as an empty remote so the sync flow can create the first commit.
+    if (this.isEmptyRepositoryResponse(response.status, response.text)) {
+      return { sha: "", url: "", tree: [], truncated: false };
+    }
+
     throw new Error(`Failed to get tree: HTTP ${response.status} - ${response.text}`);
+  }
+
+  private isEmptyRepositoryResponse(status: number, text: string): boolean {
+    return status === 409 && /Git Repository is empty/i.test(text);
   }
 
   // Helper to decode base64 content from GitHub
