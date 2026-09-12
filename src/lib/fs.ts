@@ -4,7 +4,6 @@ import { hashContent, dump } from "./helps";
 import FastSync from "../main";
 import { GitHubClient, GitHubTreeNode } from "./github-api";
 
-const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "tiff"];
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
 /**
@@ -41,13 +40,6 @@ const performSync = async (file: TFile, plugin: FastSync) => {
   plugin.addIgnoredFile(file.path);
   try {
     const isMarkdown = file.extension === "md";
-    const isImage = IMAGE_EXTENSIONS.includes(file.extension.toLowerCase());
-    
-    // 只同步 Markdown 笔记和图片，其余类型（.zip .canvas .base 等）跳过
-    // 避免向 GitHub API 发送无法处理的文件类型导致 422
-    if (!isMarkdown && !isImage) {
-      return;
-    }
 
     let content: string | ArrayBuffer;
     let currentHash: string;
@@ -175,8 +167,6 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
        if (file.stat.size > MAX_FILE_SIZE) continue;
        
        const isMarkdown = file.extension === "md";
-       const isImage = IMAGE_EXTENSIONS.includes(file.extension.toLowerCase());
-       if (!isMarkdown && !isImage) continue;
 
        let content: string | ArrayBuffer;
        let currentHash: string;
@@ -224,10 +214,9 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
 
   try {
     const remoteTree = await plugin.githubClient.getTree();
-    // 过滤 Markdown 和 图片
+    // 同步 GitHub 仓庫中的所有檔案；Markdown 以文字處理，其餘檔案以 binary 處理
     const remoteFiles = remoteTree.tree.filter((node: GitHubTreeNode) => {
-      const ext = node.path.split(".").pop()?.toLowerCase();
-      return node.type === "blob" && (ext === "md" || IMAGE_EXTENSIONS.includes(ext || ""));
+      return node.type === "blob";
     });
     const remoteFilesMap = new Map<string, string>(remoteFiles.map((f: GitHubTreeNode) => [f.path, f.sha] as [string, string]));
 
@@ -319,8 +308,6 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     let step2Push = 0, step2Skip = 0, step2Fail = 0;
     for (const file of allLocalFiles) {
       const isMarkdown = file.extension === "md";
-      const isImage = IMAGE_EXTENSIONS.includes(file.extension.toLowerCase());
-      if (!isMarkdown && !isImage) continue;
       if (file.stat.size > MAX_FILE_SIZE) continue;
 
       try {
