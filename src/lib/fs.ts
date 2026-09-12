@@ -4,7 +4,17 @@ import { hashContent, dump } from "./helps";
 import FastSync from "../main";
 import { GitHubClient, GitHubTreeNode } from "./github-api";
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const DEFAULT_MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const LARGE_FILE_MAX_SIZE = 100 * 1024 * 1024; // GitHub Contents API upper bound
+
+const getMaxFileSize = (plugin: FastSync): number =>
+  plugin.settings.syncLargeFiles ? LARGE_FILE_MAX_SIZE : DEFAULT_MAX_FILE_SIZE;
+
+const isFileTooLarge = (size: number, plugin: FastSync): boolean =>
+  size > getMaxFileSize(plugin);
+
+const getMaxFileSizeLabel = (plugin: FastSync): string =>
+  plugin.settings.syncLargeFiles ? "100MB" : "10MB";
 
 /**
  * 核心修改逻辑，包含防抖和哈希校验
@@ -15,9 +25,9 @@ export const NoteModify = function (file: TAbstractFile, plugin: FastSync, event
   if (plugin.ignoredFiles.has(file.path) && eventEnter) return;
   if (!plugin.githubClient) return;
 
-  // 1. 文件大小限制 (10MB)
-  if (file.stat.size > MAX_FILE_SIZE) {
-    new Notice(`File too large (>10MB): ${file.path}. Skipped sync.`);
+  // 1. 文件大小限制：默认 10MB；开启大文件同步后最高 100MB
+  if (isFileTooLarge(file.stat.size, plugin)) {
+    new Notice(`File too large (>${getMaxFileSizeLabel(plugin)}): ${file.path}. Skipped sync.`);
     return;
   }
 
@@ -82,6 +92,7 @@ export const NoteDelete = async function (file: TAbstractFile, plugin: FastSync,
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (plugin.ignoredFiles.has(file.path) && eventEnter) return;
   if (!plugin.githubClient) return;
+  if (file instanceof TFile && isFileTooLarge(file.stat.size, plugin)) return;
 
   // 清除防抖计时器
   if (plugin.debounceTimers.has(file.path)) {
@@ -109,6 +120,10 @@ export const NoteRename = async function (file: TAbstractFile, oldfile: string, 
   if (!(file instanceof TFile)) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
   if (!plugin.githubClient) return;
+  if (isFileTooLarge(file.stat.size, plugin)) {
+    new Notice(`File too large (>${getMaxFileSizeLabel(plugin)}): ${file.path}. Skipped sync.`);
+    return;
+  }
 
   plugin.addIgnoredFile(file.path);
   try {
@@ -164,7 +179,7 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
   try {
     const files = plugin.app.vault.getFiles();
     for (const file of files) {
-       if (file.stat.size > MAX_FILE_SIZE) continue;
+       if (isFileTooLarge(file.stat.size, plugin)) continue;
        
        const isMarkdown = file.extension === "md";
 
@@ -214,9 +229,11 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
 
   try {
     const remoteTree = await plugin.githubClient.getTree();
-    // 同步 GitHub 仓庫中的所有檔案；Markdown 以文字處理，其餘檔案以 binary 處理
+    // 同步 GitHub 仓库中的所有文件；Markdown 以文字处理，其余文件以 binary 处理。
+    // 默认跳过 >10MB；开启“大文件同步”后允许到 GitHub Contents API 的 100MB 上限。
+    const maxFileSize = getMaxFileSize(plugin);
     const remoteFiles = remoteTree.tree.filter((node: GitHubTreeNode) => {
-      return node.type === "blob";
+      return node.type === "blob" && (node.size === undefined || node.size <= maxFileSize);
     });
     const remoteFilesMap = new Map<string, string>(remoteFiles.map((f: GitHubTreeNode) => [f.path, f.sha] as [string, string]));
 
@@ -235,6 +252,8 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
         if (!localFile || (localState && localState.sha !== remoteSha) || isLocalFileEmpty) {
           const remoteData = await plugin.githubClient.getFile(path);
           if (remoteData) {
+            if (isFileTooLarge(remoteData.size, plugin)) continue;
+
             const ext = path.split(".").pop()?.toLowerCase();
             const isMarkdown = ext === "md";
             
@@ -308,7 +327,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     let step2Push = 0, step2Skip = 0, step2Fail = 0;
     for (const file of allLocalFiles) {
       const isMarkdown = file.extension === "md";
-      if (file.stat.size > MAX_FILE_SIZE) continue;
+      if (isFileTooLarge(file.stat.size, plugin)) continue;
 
       try {
         const remoteSha = remoteFilesMap.get(file.path);
