@@ -19,6 +19,8 @@ const zh_tw: Partial<LangMap> = {
   "粘贴的远端配置": "黏貼的遠端配置",
   "启用同步": "啟用同步",
   "关闭后您的笔记将不做任何同步": "關閉後您的筆記將不做任何同步",
+  "同步大文件": "同步大檔案",
+  "开启后同步超过 10MB 的文件，单文件仍受 GitHub API 100MB 上限限制": "開啟後將同步超過 10 MB 的檔案，單一檔案仍受 GitHub API 100 MB 上限限制",
   "远端服务地址": "遠端服務地址",
   "选择一个 Fast note sync service 服务地址": "選擇一個 Fast note sync service 服務地址",
   "输入您的 Fast note sync service 服务地址": "輸入您的 Image API Gateway 地址",
