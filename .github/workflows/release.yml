@@ -2,6 +2,9 @@
 
 # 触发条件配置
 on:
+  # 允许在 GitHub Actions 页面手动点击 "Run workflow" 执行
+  workflow_dispatch:
+
   push:
     # 针对 master 分支的普通提交也触发
     branches:
