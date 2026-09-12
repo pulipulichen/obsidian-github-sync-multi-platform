@@ -19,6 +19,8 @@ const en: Partial<LangMap> = {
   "粘贴的远端配置": "Pasted remote configuration",
   "启用同步": "Enable synchronization",
   "关闭后您的笔记将不做任何同步": "After closing, your notes will not be synced.",
+  "同步大文件": "Sync large files",
+  "开启后同步超过 10MB 的文件，单文件仍受 GitHub API 100MB 上限限制": "When enabled, files larger than 10 MB are synced. Individual files are still limited to 100 MB by the GitHub API.",
   "远端服务地址": "Remote service address",
   "选择一个 Fast note sync service 服务地址": "Choose a fast note sync service address",
   "输入您的 Fast note sync service 服务地址": "Enter your fast note sync service address",
