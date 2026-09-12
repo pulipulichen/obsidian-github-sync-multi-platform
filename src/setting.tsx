@@ -7,6 +7,8 @@ import { dump } from "./lib/helps";
 export interface PluginSettings {
   //是否自动上传
   syncEnabled: boolean
+  // 是否同步超过 10MB 的大文件
+  syncLargeFiles: boolean
   // GitHub 配置
   githubOwner: string
   githubRepo: string
@@ -30,6 +32,8 @@ export interface PluginSettings {
 export const DEFAULT_SETTINGS: PluginSettings = {
   // 是否自动上传
   syncEnabled: true,
+  // 默认跳过超过 10MB 的大文件
+  syncLargeFiles: false,
   // GitHub 默认值
   githubOwner: "",
   githubRepo: "",
@@ -109,6 +113,16 @@ export class SettingTab extends PluginSettingTab {
             this.display()
             await this.plugin.saveSettings()
           }
+        })
+      )
+
+    new Setting(set)
+      .setName($("同步大文件"))
+      .setDesc($("开启后同步超过 10MB 的文件，单文件仍受 GitHub API 100MB 上限限制"))
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.syncLargeFiles).onChange(async (value) => {
+          this.plugin.settings.syncLargeFiles = value
+          await this.plugin.saveSettings()
         })
       )
 
