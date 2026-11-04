@@ -31,8 +31,34 @@ export interface GitHubTree {
   truncated: boolean;
 }
 
+export const REMOTE_DELETIONS_FILE = ".github-sync-deletions.json";
+
+interface RemoteDeletionManifest {
+  version: 1;
+  paths: Record<string, number>;
+}
+
 export class GitHubClient {
   private config: GitHubConfig;
+  // The Contents API updates the branch tip for every PUT/DELETE.
+  // Serializing *all* writes avoids competing requests from this device.
+  private writeQueue: Promise<void> = Promise.resolve();
+
+  private enqueueWrite<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.writeQueue.then(operation, operation);
+    this.writeQueue = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  private async retryDelay(attempt: number): Promise<void> {
+    await new Promise<void>(resolve => setTimeout(resolve, Math.min(8000, 500 * (2 ** attempt))));
+  }
+
+  private isRetryable(status: number, body: string): boolean {
+    return status === 0 || status === 408 || status === 409 ||
+      status === 429 || status >= 500 ||
+      (status === 403 && /rate limit|abuse|secondary/i.test(body));
+  }
 
   constructor(config: GitHubConfig) {
     this.config = config;
@@ -73,29 +99,30 @@ export class GitHubClient {
   }
 
   async putFile(path: string, content: string | ArrayBuffer, sha?: string): Promise<string> {
-    const response = await this._doPutRequest(path, content, sha);
+    return this.enqueueWrite(async () => {
+      let currentSha = sha;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const response = await this._doPutRequest(path, content, currentSha);
+        if (response.status === 200 || response.status === 201) {
+          return (response.json as { content: { sha: string } }).content.sha;
+        }
 
-    // 409 = 本地缓存 sha 已过期（SHA 冲突）
-    // 422 = 验证失败，常见原因：文件已存在但未传 sha（GitHub 不一致行为）
-    // 两种情况均用相同策略：重新 GET 最新 sha 后重试一次
-    if (response.status === 409 || response.status === 422) {
-      const remoteFile = await this.getFile(path);
-      const freshSha = remoteFile?.sha;
-      if (!freshSha && response.status === 422) {
-        // 422 且远端也没有这个文件 → 真正的验证失败，不重试
-        throw new Error(`Failed to put file (422 validation error): ${response.text}`);
-      }
-      const retry = await this._doPutRequest(path, content, freshSha);
-      if (retry.status === 200 || retry.status === 201) {
-        return (retry.json as { content: { sha: string } }).content.sha;
-      }
-      throw new Error(`Failed to put file after sha retry (${response.status}→${retry.status}): ${retry.text}`);
-    }
+        // Other devices may have updated the branch, or this file's SHA
+        // may have changed. Re-read the current file before retrying.
+        if (response.status === 409 || response.status === 422) {
+          const remote = await this.getFile(path);
+          if (response.status === 422 && !remote) {
+            throw new Error(`Failed to put ${path}: HTTP 422 ${response.text}`);
+          }
+          currentSha = remote?.sha;
+        } else if (!this.isRetryable(response.status, response.text)) {
+          throw new Error(`Failed to put ${path}: HTTP ${response.status} ${response.text}`);
+        }
 
-    if (response.status === 200 || response.status === 201) {
-      return (response.json as { content: { sha: string } }).content.sha;
-    }
-    throw new Error(`Failed to put file: ${response.status} ${response.text}`);
+        if (attempt < 4) await this.retryDelay(attempt);
+      }
+      throw new Error(`Failed to put ${path} after 5 attempts`);
+    });
   }
 
   private async _doPutRequest(
@@ -153,25 +180,112 @@ export class GitHubClient {
   }
 
   async deleteFile(path: string, sha: string): Promise<void> {
-    const encodedPath = path.split('/').map(encodeURIComponent).join('/');
-    const url = `${this.baseUrl}/contents/${encodedPath}`;
-    const body = {
-      message: `sync: delete ${path}`,
-      sha,
-      branch: this.config.branch,
-    };
+    return this.enqueueWrite(async () => {
+      const encodedPath = path.split("/").map(encodeURIComponent).join("/");
+      const url = `${this.baseUrl}/contents/${encodedPath}`;
 
-    const response = await requestUrl({
-      url,
-      method: "DELETE",
-      headers: this.headers,
-      body: JSON.stringify(body),
+      for (let attempt = 0; attempt < 5; attempt++) {
+        let status = 0;
+        let responseText = "";
+        try {
+          const response = await requestUrl({
+            url,
+            method: "DELETE",
+            headers: this.headers,
+            body: JSON.stringify({ message: `sync: delete ${path}`, sha, branch: this.config.branch }),
+            throw: false,
+          });
+          status = response.status;
+          responseText = response.text;
+        } catch (error) {
+          const typed = error as { status?: number; message?: string };
+          status = typed.status ?? 0;
+          responseText = typed.message ?? String(error);
+        }
+
+        if (status === 200 || status === 204 || status === 404) return;
+        if (status === 409 || status === 422) {
+          const remote = await this.getFile(path);
+          if (!remote) return;
+          // Never discard someone else's change while retrying a deletion.
+          if (remote.sha !== sha) {
+            throw new Error(`Delete conflict: ${path} changed on GitHub`);
+          }
+        } else if (!this.isRetryable(status, responseText)) {
+          throw new Error(`Failed to delete ${path}: HTTP ${status} ${responseText}`);
+        }
+
+        if (attempt < 4) await this.retryDelay(attempt);
+      }
+      throw new Error(`Failed to delete ${path} after 5 attempts (branch contention)`);
     });
+  }
 
-    // B5: GitHub DELETE 成功返回 200（有响应体）或 204（无内容）
-    if (response.status !== 200 && response.status !== 204) {
-      throw new Error(`Failed to delete file: ${response.status} ${response.text}`);
+  /**
+   * Repository-wide deletion journal: another device may lack a local SHA
+   * cache, so absence on GitHub alone is not enough to prevent re-upload.
+   * Malformed journals fail closed instead of silently resurrecting files.
+   */
+  async getRemoteDeletions(): Promise<Record<string, number>> {
+    const remote = await this.getFile(REMOTE_DELETIONS_FILE);
+    if (!remote) return {};
+    return this.parseRemoteDeletions(remote.content);
+  }
+
+  private parseRemoteDeletions(content: string): Record<string, number> {
+    try {
+      const parsed = JSON.parse(GitHubClient.decodeContent(content)) as RemoteDeletionManifest;
+      if (parsed.version !== 1 || !parsed.paths || typeof parsed.paths !== "object" ||
+          Array.isArray(parsed.paths)) {
+        throw new Error("Unsupported deletion journal format");
+      }
+      const paths: Record<string, number> = {};
+      for (const [path, timestamp] of Object.entries(parsed.paths)) {
+        if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) {
+          throw new Error("Invalid deletion timestamp");
+        }
+        Object.defineProperty(paths, path, { value: timestamp, writable: true, enumerable: true, configurable: true });
+      }
+      return paths;
+    } catch (error) {
+      throw new Error(`Cannot read deletion journal: ${(error as Error).message}`);
     }
+  }
+
+  async updateRemoteDeletions(mark: string[] = [], clear: string[] = []): Promise<void> {
+    if (mark.length === 0 && clear.length === 0) return;
+    return this.enqueueWrite(async () => {
+      for (let attempt = 0; attempt < 5; attempt++) {
+        const remote = await this.getFile(REMOTE_DELETIONS_FILE);
+        const current = remote ? this.parseRemoteDeletions(remote.content) : {};
+        let changed = false;
+        const now = Date.now();
+        for (const path of mark) {
+          if (!Object.prototype.hasOwnProperty.call(current, path)) {
+            Object.defineProperty(current, path, { value: now, writable: true, enumerable: true, configurable: true });
+            changed = true;
+          }
+        }
+        for (const path of clear) {
+          if (Object.prototype.hasOwnProperty.call(current, path)) {
+            delete current[path];
+            changed = true;
+          }
+        }
+        if (!changed) return;
+
+        const content = JSON.stringify({ version: 1, paths: current }, null, 2) + "\n";
+        const response = await this._doPutRequest(REMOTE_DELETIONS_FILE, content, remote?.sha);
+        if (response.status === 200 || response.status === 201) return;
+        if ((response.status === 409 || response.status === 422 ||
+            this.isRetryable(response.status, response.text)) && attempt < 4) {
+          await this.retryDelay(attempt);
+          continue;
+        }
+        throw new Error(`Failed to update deletion journal: HTTP ${response.status} ${response.text}`);
+      }
+      throw new Error("Failed to update deletion journal after 5 attempts");
+    });
   }
 
   async getLatestCommit(path?: string): Promise<string | null> {
