@@ -22,6 +22,7 @@ const getMaxFileSizeLabel = (plugin: FastSync): string =>
 export const NoteModify = function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
   if (!(file instanceof TFile)) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
+  if (eventEnter && !plugin.settings.syncEnabled) return;
   if (plugin.ignoredFiles.has(file.path) && eventEnter) return;
   if (!plugin.githubClient) return;
 
@@ -78,6 +79,15 @@ const performSync = async (file: TFile, plugin: FastSync) => {
       hash: currentHash
     };
     await plugin.saveSyncData();
+    // A delete may have arrived while this PUT request was in flight.
+    // Preserve the tombstone and remove any accidentally re-uploaded file.
+    if (plugin.syncData.pendingDeletes[file.path] ||
+        plugin.app.vault.getAbstractFileByPath(file.path) !== file) {
+      plugin.syncData.pendingDeletes[file.path] ??= Date.now();
+      await plugin.saveSyncData();
+      await flushPendingDeletes(plugin);
+      return;
+    }
     dump(`Synced ${file.path} to GitHub`, newSha);
 
   } catch (error) {
@@ -301,7 +311,7 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
       throw new Error("GitHub returned a truncated tree; refusing to infer deletions.");
     }
     const allRemoteFilesMap = new Map<string, string>(
-      remoteTree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha])
+      remoteTree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha] as [string, string])
     );
     // 同步 GitHub 仓库中的所有文件；Markdown 以文字处理，其余文件以 binary 处理。
     // 默认跳过 >10MB；开启“大文件同步”后允许到 GitHub Contents API 的 100MB 上限。
