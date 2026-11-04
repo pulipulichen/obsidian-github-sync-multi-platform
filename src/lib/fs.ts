@@ -88,37 +88,105 @@ const performSync = async (file: TFile, plugin: FastSync) => {
   }
 };
 
-export const NoteDelete = async function (file: TAbstractFile, plugin: FastSync, eventEnter: boolean = false) {
-  if (!plugin.isWatchEnabled && eventEnter) return;
-  if (plugin.ignoredFiles.has(file.path) && eventEnter) return;
-  if (!plugin.githubClient) return;
-  if (file instanceof TFile && isFileTooLarge(file.stat.size, plugin)) return;
 
-  // 清除防抖计时器
-  if (plugin.debounceTimers.has(file.path)) {
-    clearTimeout(plugin.debounceTimers.get(file.path));
-    plugin.debounceTimers.delete(file.path);
+/** The dashboard's generated statistics file is not a Vault note. */
+const isInternalSyncPath = (path: string, plugin: FastSync): boolean =>
+  path === plugin.app.vault.configDir + "/sync-stats.json";
+
+/**
+ * Keep deletion tombstones until GitHub confirms each delete. A remote edit
+ * made since this device last synced is a conflict, never silently discarded.
+ */
+export async function flushPendingDeletes(
+  plugin: FastSync,
+  remoteFilesMap?: Map<string, string>
+): Promise<void> {
+  if (!plugin.githubClient) return;
+
+  for (const path of Object.keys(plugin.syncData.pendingDeletes)) {
+    if (plugin.deletingPaths.has(path)) continue;
+    plugin.deletingPaths.add(path);
+    try {
+      // A file may have been recreated before the remote delete was attempted.
+      if (plugin.app.vault.getAbstractFileByPath(path) instanceof TFile) {
+        delete plugin.syncData.pendingDeletes[path];
+        await plugin.saveSyncData();
+        continue;
+      }
+
+      if (isInternalSyncPath(path, plugin)) {
+        delete plugin.syncData.pendingDeletes[path];
+        await plugin.saveSyncData();
+        continue;
+      }
+
+      const remoteFile = await plugin.githubClient.getFile(path);
+      const lastKnownSha = plugin.syncData.files[path]?.sha;
+      if (remoteFile && lastKnownSha && remoteFile.sha !== lastKnownSha) {
+        console.warn("Remote deletion conflict for " + path + ": remote content changed");
+        new Notice("Delete conflict: " + path + " changed on GitHub; remote copy preserved.");
+        continue;
+      }
+
+      if (remoteFile) {
+        await plugin.githubClient.deleteFile(path, remoteFile.sha);
+      }
+      delete plugin.syncData.files[path];
+      delete plugin.syncData.pendingDeletes[path];
+      remoteFilesMap?.delete(path);
+      await plugin.saveSyncData();
+      dump("Deleted " + path + " from GitHub (or already absent)");
+    } catch (error) {
+      // Keep the tombstone so a later full sync can retry without restoring it.
+      console.error("Delete failed for " + path + "; will retry at next sync:", error);
+      new Notice("Delete failed for " + path + "; will retry during next sync.");
+    } finally {
+      plugin.deletingPaths.delete(path);
+    }
+  }
+}
+
+/**
+ * A live delete is recorded even while a full sync has its watcher disabled.
+ * Folder deletes queue every previously tracked descendant.
+ */
+export const NoteDelete = async function (
+  file: TAbstractFile,
+  plugin: FastSync,
+  eventEnter: boolean = false
+) {
+  if (eventEnter && !plugin.settings.syncEnabled) return;
+  if (!plugin.githubClient) return;
+
+  const targets = file instanceof TFile
+    ? [file.path]
+    : [...Object.keys(plugin.syncData.files), ...Object.keys(plugin.syncData.pendingDeletes)]
+        .filter(path => path.startsWith(file.path + "/"));
+
+  let queued = false;
+  for (const path of new Set(targets)) {
+    if (isInternalSyncPath(path, plugin)) continue;
+    // Only our own remote->local trash operations are excluded.
+    if (eventEnter && plugin.remoteDeletionPaths.has(path)) continue;
+    if (plugin.debounceTimers.has(path)) {
+      clearTimeout(plugin.debounceTimers.get(path));
+      plugin.debounceTimers.delete(path);
+    }
+    plugin.syncData.pendingDeletes[path] = Date.now();
+    queued = true;
   }
 
-  plugin.addIgnoredFile(file.path);
-  try {
-    const sha = plugin.syncData.files[file.path]?.sha;
-    if (sha) {
-      await plugin.githubClient.deleteFile(file.path, sha);
-      delete plugin.syncData.files[file.path];
-      await plugin.saveSyncData();
-      dump(`Deleted ${file.path} from GitHub`);
-    }
-  } catch (error) {
-    console.error("Delete failed:", error);
-  } finally {
-    plugin.removeIgnoredFile(file.path);
+  if (!queued) return;
+  await plugin.saveSyncData();
+  if (!plugin.isSyncInProgress) {
+    await flushPendingDeletes(plugin);
   }
 };
 
 export const NoteRename = async function (file: TAbstractFile, oldfile: string, plugin: FastSync, eventEnter: boolean = false) {
   if (!(file instanceof TFile)) return;
   if (!plugin.isWatchEnabled && eventEnter) return;
+  if (eventEnter && !plugin.settings.syncEnabled) return;
   if (!plugin.githubClient) return;
   if (isFileTooLarge(file.stat.size, plugin)) {
     new Notice(`File too large (>${getMaxFileSizeLabel(plugin)}): ${file.path}. Skipped sync.`);
@@ -127,11 +195,11 @@ export const NoteRename = async function (file: TAbstractFile, oldfile: string, 
 
   plugin.addIgnoredFile(file.path);
   try {
-    // 1. 删除旧路径
-    const oldSha = plugin.syncData.files[oldfile]?.sha;
-    if (oldSha) {
-      await plugin.githubClient.deleteFile(oldfile, oldSha);
-      delete plugin.syncData.files[oldfile];
+    // 1. Queue the old path even if its SHA was never cached.
+    if (oldfile !== file.path) {
+      plugin.syncData.pendingDeletes[oldfile] = Date.now();
+      await plugin.saveSyncData();
+      await flushPendingDeletes(plugin);
     }
 
     // 2. 上传新路径
@@ -229,6 +297,12 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
 
   try {
     const remoteTree = await plugin.githubClient.getTree();
+    if (remoteTree.truncated) {
+      throw new Error("GitHub returned a truncated tree; refusing to infer deletions.");
+    }
+    const allRemoteFilesMap = new Map<string, string>(
+      remoteTree.tree.filter(node => node.type === "blob").map(node => [node.path, node.sha])
+    );
     // 同步 GitHub 仓库中的所有文件；Markdown 以文字处理，其余文件以 binary 处理。
     // 默认跳过 >10MB；开启“大文件同步”后允许到 GitHub Contents API 的 100MB 上限。
     const maxFileSize = getMaxFileSize(plugin);
@@ -239,10 +313,47 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
 
     const allLocalFiles = plugin.app.vault.getFiles();
     const localFilesMap = new Map<string, TFile>(allLocalFiles.map(f => [f.path, f]));
+    const protectedFromUpload = new Set<string>();
+
+    // Reconcile deletions BEFORE the pull phase. Never treat an untracked
+    // remote-only file as locally deleted on a device's first sync.
+    for (const path of Object.keys(plugin.syncData.files)) {
+      if (isInternalSyncPath(path, plugin)) continue;
+      const localFile = localFilesMap.get(path);
+      const remoteSha = allRemoteFilesMap.get(path);
+
+      if (!localFile && remoteSha) {
+        // File disappeared locally while the app was closed or watching was off.
+        plugin.syncData.pendingDeletes[path] ??= Date.now();
+      } else if (localFile && !remoteSha) {
+        // Another device deleted this previously-synced file from GitHub.
+        // Obsidian trash (rather than permanent deletion) permits recovery.
+        plugin.remoteDeletionPaths.add(path);
+        try {
+          await plugin.app.vault.trash(localFile, false);
+          localFilesMap.delete(path);
+          delete plugin.syncData.files[path];
+          delete plugin.syncData.pendingDeletes[path];
+          dump("Moved remotely deleted file to Obsidian trash: " + path);
+        } catch (error) {
+          console.error("Could not trash remotely deleted file " + path, error);
+          protectedFromUpload.add(path);
+        } finally {
+          plugin.remoteDeletionPaths.delete(path);
+        }
+      } else if (!localFile && !remoteSha) {
+        delete plugin.syncData.files[path];
+        delete plugin.syncData.pendingDeletes[path];
+      }
+    }
+
+    await plugin.saveSyncData();
+    await flushPendingDeletes(plugin, remoteFilesMap);
 
     // 1. 下拉远端变更
     let step1Count = 0;
     for (const [path, remoteSha] of Array.from(remoteFilesMap.entries())) {
+      if (plugin.syncData.pendingDeletes[path]) continue;
       try {
         const localFile = localFilesMap.get(path);
         const localState = plugin.syncData.files[path];
@@ -326,6 +437,9 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     // 2. 推送本地文件：新增文件 + 本地内容有变化的已有文件
     let step2Push = 0, step2Skip = 0, step2Fail = 0;
     for (const file of allLocalFiles) {
+      // The snapshot may include a file removed by remote deletion reconciliation.
+      if (plugin.app.vault.getAbstractFileByPath(file.path) !== file) continue;
+      if (plugin.syncData.pendingDeletes[file.path] || protectedFromUpload.has(file.path)) continue;
       const isMarkdown = file.extension === "md";
       if (isFileTooLarge(file.stat.size, plugin)) continue;
 
@@ -378,6 +492,8 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
       }
     }
     
+    // Catch user deletes that arrived while the pull/push steps were running.
+    await flushPendingDeletes(plugin, remoteFilesMap);
     await plugin.saveSyncData();
     // B6: updateStats 异步执行，不阻塞主同步流程
     plugin.updateStats().catch(e => console.error("Stats update failed:", e));
