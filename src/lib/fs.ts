@@ -25,6 +25,7 @@ export const NoteModify = function (file: TAbstractFile, plugin: FastSync, event
   if (eventEnter && !plugin.settings.syncEnabled) return;
   if (plugin.ignoredFiles.has(file.path) && eventEnter) return;
   if (!plugin.githubClient) return;
+  if (isInternalSyncPath(file.path, plugin)) return;
   if (createdLocally) plugin.localCreations.add(file.path);
 
   // 1. 文件大小限制：默认 10MB；开启大文件同步后最高 100MB
@@ -121,7 +122,8 @@ const performSync = async (file: TFile, plugin: FastSync) => {
 
 /** The dashboard's generated statistics file is not a Vault note. */
 const isInternalSyncPath = (path: string, plugin: FastSync): boolean =>
-  path === plugin.app.vault.configDir + "/sync-stats.json";
+  path === plugin.app.vault.configDir + "/sync-stats.json" ||
+  path === REMOTE_DELETIONS_FILE;
 
 /**
  * Keep deletion tombstones until GitHub confirms each delete. A remote edit
@@ -368,7 +370,7 @@ export async function overrideRemoteAllFilesImpl(plugin: FastSync): Promise<void
     // existing deletion tombstones for paths that the user wants to restore.
     await plugin.githubClient.updateRemoteDeletions([], files.map(file => file.path));
     for (const file of files) {
-       if (isFileTooLarge(file.stat.size, plugin)) continue;
+       if (isInternalSyncPath(file.path, plugin) || isFileTooLarge(file.stat.size, plugin)) continue;
        
        const isMarkdown = file.extension === "md";
 
@@ -441,6 +443,12 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     // The shared journal is authoritative even on a new device that has no
     // local file history. This prevents stale local files being re-uploaded.
     for (const path of Object.keys(remoteDeletions)) {
+      if (plugin.localCreations.has(path)) {
+        // A real local create event is an explicit intention to restore.
+        await plugin.githubClient.updateRemoteDeletions([], [path]);
+        delete remoteDeletions[path];
+        continue;
+      }
       const localFile = localFilesMap.get(path);
       if (localFile) {
         plugin.remoteDeletionPaths.add(path);
@@ -587,7 +595,8 @@ export async function syncAllFilesImpl(plugin: FastSync): Promise<void> {
     let step2Push = 0, step2Skip = 0, step2Fail = 0;
     for (const file of allLocalFiles) {
       // The snapshot may include a file removed by remote deletion reconciliation.
-      if (plugin.app.vault.getAbstractFileByPath(file.path) !== file) continue;
+      if (plugin.app.vault.getAbstractFileByPath(file.path) !== file ||
+          isInternalSyncPath(file.path, plugin)) continue;
       if (plugin.syncData.pendingDeletes[file.path] || protectedFromUpload.has(file.path) ||
           Object.prototype.hasOwnProperty.call(remoteDeletions, file.path)) continue;
       const isMarkdown = file.extension === "md";
