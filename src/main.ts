@@ -32,6 +32,7 @@ export default class FastSync extends Plugin {
   githubClient: GitHubClient
   syncData: SyncData = { files: {}, pendingDeletes: {} }
   deletingPaths: Set<string> = new Set()
+  remoteDeletionPaths: Set<string> = new Set()
   private persistQueue: Promise<void> = Promise.resolve()
   
   isSyncInProgress: boolean = false
