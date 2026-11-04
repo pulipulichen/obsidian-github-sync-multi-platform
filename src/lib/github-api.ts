@@ -64,9 +64,10 @@ export class GitHubClient {
       if (response.status === 200) {
         return response.json as GitHubFileResponse;
       }
-      return null;
+      if (response.status === 404) return null;
+      throw new Error(`Failed to get ${path}: HTTP ${response.status} ${response.text}`);
     } catch (error) {
-      if (error.status === 404) return null;
+      if ((error as { status?: number }).status === 404) return null;
       throw error;
     }
   }
