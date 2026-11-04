@@ -22,13 +22,17 @@ export interface FileState {
 
 export interface SyncData {
   files: { [path: string]: FileState };
+  pendingDeletes: { [path: string]: number };
+  repository?: string;
 }
 
 export default class FastSync extends Plugin {
   settingTab: SettingTab
   settings: PluginSettings
   githubClient: GitHubClient
-  syncData: SyncData = { files: {} }
+  syncData: SyncData = { files: {}, pendingDeletes: {} }
+  deletingPaths: Set<string> = new Set()
+  private persistQueue: Promise<void> = Promise.resolve()
   
   isSyncInProgress: boolean = false
   debounceTimers: Map<string, number> = new Map()
@@ -124,6 +128,13 @@ export default class FastSync extends Plugin {
 
   initGitHubClient() {
     if (this.settings.githubToken && this.settings.githubOwner && this.settings.githubRepo) {
+      const repository = `${this.settings.githubOwner}/${this.settings.githubRepo}@${this.settings.githubBranch || "main"}`;
+      // A new repository must never inherit the previous repository's deletion history.
+      if (this.syncData.repository && this.syncData.repository !== repository) {
+        this.syncData = { files: {}, pendingDeletes: {}, repository };
+      } else {
+        this.syncData.repository = repository;
+      }
       this.githubClient = new GitHubClient({
         token: this.settings.githubToken,
         owner: this.settings.githubOwner,
@@ -154,10 +165,15 @@ export default class FastSync extends Plugin {
    * 避免 saveSettings / saveSyncData 互相覆盖对方的数据。
    */
   async persistData() {
-    await this.saveData({
+    // Serialize writes: concurrent vault events must not overwrite newer tombstones.
+    const snapshot = JSON.parse(JSON.stringify({
       settings: this.settings,
       syncData: this.syncData,
-    });
+    }));
+    this.persistQueue = this.persistQueue.catch(error => {
+      console.error("Previous sync state write failed:", error);
+    }).then(() => this.saveData(snapshot));
+    await this.persistQueue;
   }
 
   async loadSettings() {
@@ -175,7 +191,11 @@ export default class FastSync extends Plugin {
 
   async loadSyncData() {
     const data = await this.loadData() ?? {};
-    this.syncData = data.syncData ?? { files: {} };
+    this.syncData = {
+      files: data.syncData?.files ?? {},
+      pendingDeletes: data.syncData?.pendingDeletes ?? {},
+      repository: data.syncData?.repository,
+    };
   }
 
   async saveSyncData() {
