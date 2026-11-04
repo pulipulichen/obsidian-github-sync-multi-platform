@@ -33,6 +33,10 @@ export default class FastSync extends Plugin {
   syncData: SyncData = { files: {}, pendingDeletes: {} }
   deletingPaths: Set<string> = new Set()
   remoteDeletionPaths: Set<string> = new Set()
+  // Only a real local "create" event may intentionally resurrect a deleted path.
+  localCreations: Set<string> = new Set()
+  deletionFlushPromise: Promise<void> | null = null
+  deletionFlushTimer: number | null = null
   private persistQueue: Promise<void> = Promise.resolve()
   
   isSyncInProgress: boolean = false
@@ -89,7 +93,7 @@ export default class FastSync extends Plugin {
     // 注册文件事件（只监听 md 和图片，过滤其他类型在 performSync 内完成）
     // 启动时先禁用 watch，防止 vault 索引触发大量文件事件并发打 API 被 GitHub 限速（422）
     this.disableWatch()
-    this.registerEvent(this.app.vault.on("create", (file) => NoteModify(file, this, true)))
+    this.registerEvent(this.app.vault.on("create", (file) => NoteModify(file, this, true, true)))
     this.registerEvent(this.app.vault.on("modify", (file) => NoteModify(file, this, true)))
     this.registerEvent(this.app.vault.on("delete", (file) => NoteDelete(file, this, true)))
     this.registerEvent(this.app.vault.on("rename", (file, oldfile) => NoteRename(file, oldfile, this, true)))
@@ -149,6 +153,10 @@ export default class FastSync extends Plugin {
     // 清理所有防抖计时器，防止插件卸载后仍有回调触发（内存泄漏）
     this.debounceTimers.forEach(timer => clearTimeout(timer));
     this.debounceTimers.clear();
+    if (this.deletionFlushTimer !== null) {
+      clearTimeout(this.deletionFlushTimer);
+      this.deletionFlushTimer = null;
+    }
   }
 
   updateRibbonIcon(status: boolean) {
