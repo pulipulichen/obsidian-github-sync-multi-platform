@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.0.10 — 2026-11-05
+
+### Fixed: bulk deletion conflicts and files returning after deletion
+
+- All GitHub Contents API writes from one Obsidian device now share a serialized queue, with bounded retry and backoff for branch contention and rate limits.
+- Batch and folder deletes use a single-flight worker and an 800 ms debounce, not hundreds of competing DELETE requests.
+- A repository-wide `.github-sync-deletions.json` journal records deleted paths before removing the actual files. Other upgraded clients consult this journal on full sync and move stale local copies to the Obsidian trash instead of re-uploading them.
+- An intentional local CREATE event or the explicit force-overwrite action can restore a journaled path; ordinary stale MODIFY events cannot.
+- A folder rename also queues tracked old file paths for deletion and uploads their new paths.
+- A remote SHA edit discovered before deletion remains protected from automatic removal. Per-file failures are logged to the developer console and summarized in one notification.
+- The deletion journal is synchronization metadata and must not itself be pulled into, or uploaded from, the Vault.
+- GitHub commit history remains available for recovering deleted files.
+
+### Important upgrade notes
+
+- **Upgrade the plugin on every device** before performing another bulk cleanup. Older plugin builds do not understand the shared deletion journal and can still re-upload deleted files.
+- Deletions made *directly* in the GitHub web interface do not create journal entries; they rely on the local per-device file inventory.
+- The journal intentionally retains deleted paths; use a local explicit create or force-overwrite to reuse a previously deleted path.
+- For testing, back up the Vault and first delete a small disposable folder on one device, then sync another device.
+
+
 ## 1.0.9 — 2026-11-04
 
 ### Fixed: Obsidian deletes were not propagated to GitHub
